@@ -24,7 +24,7 @@
 ### 第一步：推送 JS 拦截脚本
 将本项目的 `hook_awcocxb.js` 推送到手机的 `/data/local/tmp/` 目录下，并赋予执行权限。
 ```bash
-adb push hook_awcocxb.js /data/local/tmp/
+adb push hook.js /data/local/tmp/hook_awcocxb.js
 adb shell
 su
 chmod 777 /data/local/tmp/hook_awcocxb.js

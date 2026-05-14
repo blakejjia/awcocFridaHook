@@ -1,145 +1,154 @@
+/**
+ * Optimized Native MITM Script (Short-circuiting)
+ * Features: Native Logcat support for Zygisk-Frida / Background deployment
+ */
+
 const Color = {
     RED: "\x1b[31m", GREEN: "\x1b[32m", YELLOW: "\x1b[33m",
     BLUE: "\x1b[34m", MAGENTA: "\x1b[35m", CYAN: "\x1b[36m", RESET: "\x1b[0m"
 };
 
-console.log(Color.BLUE + "[*] Script loaded. Waiting 1s before applying hooks..." + Color.RESET);
-
-setTimeout(function () {
-    const libc = Process.findModuleByName("libc.so");
-    if (libc) {
-        console.log(Color.GREEN + "[*] 1s delay finished. Applying libc hooks..." + Color.RESET);
-
-        // 追踪哪些 FD 需要 Hook 响应 (cawd.php)
-        const pendingFds = {};
-        // 追踪哪些 FD 需要拦截并伪造响应 (xawd.php)
-        const blockedFds = {};
-
-        // --- Hook 发送函数 (send, sendto) ---
-        const sendTargets = ["send", "sendto"];
-
-        function isTargetHttp(buf, len) {
-            if (len < 4) return false;
-            try {
-                const bytes = buf.readByteArray(Math.min(len, 4));
-                const view = new Uint8Array(bytes);
-                return (view[0] === 0x50 && view[1] === 0x4F && view[2] === 0x53 && view[3] === 0x54) || // POST
-                    (view[0] === 0x47 && view[1] === 0x45 && view[2] === 0x54); // GET
-            } catch (e) { return false; }
+// --- 0. 日志系统集成 (同时支持终端和 Logcat) ---
+const logger = (function () {
+    let nativeLog = null;
+    try {
+        const logPtr = Module.findExportByName("liblog.so", "__android_log_print");
+        if (logPtr) {
+            const logFunc = new NativeFunction(logPtr, 'int', ['int', 'pointer', 'pointer']);
+            const tagPtr = Memory.allocUtf8String("FridaMITM");
+            // 3 = DEBUG 级别
+            nativeLog = (msg) => logFunc(3, tagPtr, Memory.allocUtf8String(msg));
         }
+    } catch (e) { }
 
-        sendTargets.forEach(function (name) {
-            const funcPtr = libc.getExportByName(name);
-            if (!funcPtr) return;
-
-            Interceptor.attach(funcPtr, {
-                onEnter: function (args) {
-                    const fd = args[0].toInt32();
-                    const bufPtr = args[1];
-                    const originalLen = args[2].toInt32();
-
-                    if (bufPtr && originalLen > 0 && isTargetHttp(bufPtr, originalLen)) {
-                        try {
-                            let originalStr = bufPtr.readUtf8String(originalLen);
-
-                            // 逻辑 A: 处理 cawd.php (记录 FD，后面修改它的真实响应)
-                            if (originalStr.includes("/awcocxb2/cawd.php")) {
-                                console.log(Color.YELLOW + "\n[!] Target Request Detected (cawd.php) on FD: " + fd + Color.RESET);
-                                pendingFds[fd] = true;
-                            }
-
-                            // 逻辑 B: 处理 xawd.php (直接拦截，不让发出去)
-                            if (originalStr.includes("/awcocxb2/xawd.php")) {
-                                console.log(Color.MAGENTA + "\n[!] BLOCKING Request to xawd.php on FD: " + fd + Color.RESET);
-
-                                this.isXawd = true;
-                                this.origLen = originalLen;
-                                this.fd = fd;
-
-                                // 将发送长度改为 0，阻止数据发出
-                                args[2] = ptr(0);
-
-                                // 标记此 FD，在后续 recv 中返回伪造的成功内容
-                                blockedFds[fd] = true;
-                            }
-                        } catch (e) { }
-                    }
-                },
-                onLeave: function (retval) {
-                    if (this.isXawd) {
-                        // 告诉应用层：所有数据都“发送成功”了
-                        retval.replace(ptr(this.origLen));
-                        console.log(Color.GREEN + "[!] xawd.php intercepted: original length returned to app." + Color.RESET);
-                    }
-                }
-            });
-        });
-
-        // --- Hook 接收函数 (recv, recvfrom, read) ---
-        const recvTargets = ["recv", "recvfrom", "read"];
-
-        recvTargets.forEach(function (name) {
-            const funcPtr = libc.getExportByName(name);
-            if (!funcPtr) return;
-
-            Interceptor.attach(funcPtr, {
-                onEnter: function (args) {
-                    this.fd = args[0].toInt32();
-                    this.buf = args[1];
-                },
-                onLeave: function (retval) {
-                    const bytesRead = retval.toInt32();
-
-                    // 处理 cawd.php 的真实响应修改
-                    if (bytesRead > 0 && pendingFds[this.fd]) {
-                        try {
-                            console.log(Color.CYAN + "\n[!] Modifying Original Response (cawd.php, FD: " + this.fd + "):" + Color.RESET);
-                            const originalData = this.buf.readByteArray(bytesRead);
-                            console.log(hexdump(originalData, { offset: 0, length: bytesRead, header: true, ansi: true }));
-
-                            const replacement = "9999999";
-                            this.buf.writeUtf8String(replacement);
-                            retval.replace(ptr(replacement.length));
-
-                            console.log(Color.GREEN + "[!] Response modified to: " + replacement + Color.RESET);
-                            delete pendingFds[this.fd];
-                        } catch (e) {
-                            console.error(Color.RED + "Error modifying cawd.php response: " + e + Color.RESET);
-                        }
-                    }
-
-                    // 为 xawd.php 伪造一个“成功”的响应
-                    if (blockedFds[this.fd]) {
-                        try {
-                            console.log(Color.MAGENTA + "\n[!] Faking Success Response for xawd.php (FD: " + this.fd + ")" + Color.RESET);
-
-                            const fakeResponse = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1\r\n\r\n1";
-                            this.buf.writeUtf8String(fakeResponse);
-
-                            retval.replace(ptr(fakeResponse.length));
-
-                            console.log(Color.GREEN + "[!] Fake success '1' sent to app." + Color.RESET);
-                            delete blockedFds[this.fd];
-                        } catch (e) {
-                            console.error(Color.RED + "Error faking xawd.php response: " + e + Color.RESET);
-                        }
-                    }
-                }
-            });
-        });
-
-        // 监听 FD 关闭
-        const closePtr = libc.getExportByName("close");
-        if (closePtr) {
-            Interceptor.attach(closePtr, {
-                onEnter: function (args) {
-                    const fd = args[0].toInt32();
-                    delete pendingFds[fd];
-                    delete blockedFds[fd];
-                }
-            });
+    return function (msg, color = "") {
+        // 1. 输出到 Frida 终端 (带颜色)
+        console.log(color + msg + Color.RESET);
+        // 2. 输出到系统 Logcat (无颜色)
+        if (nativeLog) {
+            try { nativeLog(msg); } catch (e) { }
         }
+    };
+})();
+
+logger("[*] Script loaded. Applying Native MITM hooks...", Color.BLUE);
+
+// --- 1. 配置中心 ---
+const MOCK_CONFIG = {
+    "cawd.php": () => {
+        const body = "爱玩豆(30.000个)≈0年30天0小时0分0秒";
+        return buildFullResponse(body, true);
+    },
+    "xawd.php": () => buildFullResponse("1", false)
+};
+
+// --- 2. 核心辅助工具 ---
+function getRealByteLen(str) {
+    const m = Memory.allocUtf8String(str);
+    let i = 0;
+    while (m.add(i).readU8() !== 0) i++;
+    return i;
+}
+
+function buildFullResponse(body, isChunked) {
+    const date = new Date().toUTCString();
+    let head = `HTTP/1.1 200 OK\r\nDate: ${date}\r\nServer: Apache/2.4.39 (Win64)\r\nContent-Type: text/html; charset=UTF-8\r\n`;
+
+    if (isChunked) {
+        const bodyLen = getRealByteLen(body);
+        const hexLen = bodyLen.toString(16);
+        return `${head}Transfer-Encoding: chunked\r\n\r\n${hexLen}\r\n${body}\r\n0\r\n\r\n`;
     } else {
-        console.error(Color.RED + "libc.so not found!" + Color.RESET);
+        return `${head}Content-Length: ${getRealByteLen(body)}\r\n\r\n${body}`;
     }
-}, 1000);
+}
+
+// --- 3. 拦截引擎 ---
+function init() {
+    const libc = Process.findModuleByName("libc.so") || Process.getModuleByName("libc.so");
+    if (!libc) return logger("libc.so not found!", Color.RED);
+
+    const blockedFds = new Map();
+    const POLLIN = 1;
+
+    // A. 拦截发送
+    ["send", "sendto", "write"].forEach(name => {
+        const funcPtr = libc.findExportByName(name);
+        if (!funcPtr) return;
+        Interceptor.attach(funcPtr, {
+            onEnter(args) {
+                const fd = args[0].toInt32();
+                const len = args[2].toInt32();
+                if (len < 10) return;
+
+                try {
+                    const buf = args[1].readUtf8String(Math.min(len, 256));
+                    for (const path in MOCK_CONFIG) {
+                        if (buf.indexOf(path) !== -1) {
+                            logger(`[!] Intercepted ${path} (FD: ${fd})`, Color.YELLOW);
+                            this.fd = fd;
+                            this.origLen = len;
+                            args[2] = ptr(0);
+                            blockedFds.set(fd, path);
+                            break;
+                        }
+                    }
+                } catch (e) { }
+            },
+            onLeave(retval) {
+                if (this.fd) retval.replace(ptr(this.origLen));
+            }
+        });
+    });
+
+    // B. 伪造事件循环 (Poll)
+    const pollPtr = libc.findExportByName("poll");
+    if (pollPtr) {
+        Interceptor.attach(pollPtr, {
+            onEnter(args) { this.fds = args[0]; this.nfds = args[1].toInt32(); },
+            onLeave(retval) {
+                for (let i = 0; i < this.nfds; i++) {
+                    const fdPtr = this.fds.add(i * 8);
+                    const fd = fdPtr.readInt();
+                    if (blockedFds.has(fd)) {
+                        fdPtr.add(6).writeShort(POLLIN);
+                        if (retval.toInt32() === 0) retval.replace(ptr(1));
+                        logger(`[*] Spoofed Poll for FD ${fd}`, Color.CYAN);
+                    }
+                }
+            }
+        });
+    }
+
+    // C. 注入响应
+    ["recv", "recvfrom", "read"].forEach(name => {
+        const funcPtr = libc.findExportByName(name);
+        if (!funcPtr) return;
+        Interceptor.attach(funcPtr, {
+            onEnter(args) { this.fd = args[0].toInt32(); this.buf = args[1]; },
+            onLeave(retval) {
+                const path = blockedFds.get(this.fd);
+                if (path) {
+                    const fakeRes = MOCK_CONFIG[path]();
+                    const realLen = getRealByteLen(fakeRes);
+                    this.buf.writeUtf8String(fakeRes);
+                    retval.replace(ptr(realLen));
+                    logger(`[!] Injected Fake ${path} (${realLen} bytes)`, Color.GREEN);
+                    blockedFds.delete(this.fd);
+                }
+            }
+        });
+    });
+
+    // D. 资源清理
+    const closePtr = libc.findExportByName("close");
+    if (closePtr) {
+        Interceptor.attach(closePtr, { onEnter(args) { blockedFds.delete(args[0].toInt32()); } });
+    }
+}
+
+try {
+    init();
+} catch (e) {
+    logger(`Initialization failed: ${e}`, Color.RED);
+}
